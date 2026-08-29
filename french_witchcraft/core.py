@@ -1,10 +1,39 @@
+#!/usr/bin/env python3
 """
-French Witchcraft — API reverse engineering core.
+api_re.py — API Reverse Engineering Tool
 
-30-phase autonomous API analysis: discovery, schema extraction, injection,
-auth attacks, BOLA/BFLA, OAuth2, GraphQL, gRPC, SOAP, JSON-RPC, business
-logic, CORS, NoSQL, PII exposure, host header, timing oracle, WebSocket,
-shadow versions, null byte evasion.
+Autonomously reverse engineers unknown HTTP APIs by:
+  1. Discovery: path fuzzing, method fuzzing, OpenAPI harvesting
+  2. Schema extraction: parameter types, required vs optional, defaults
+  3. Behavior mapping: input→output, error classification, state changes
+  4. Secret extraction: error messages, stack traces, headers, timing
+  5. Vuln surface mapping: injection points, file paths, deserialization
+
+Techniques grounded in:
+  - OWASP API Security Top 10 (BOLA, mass assignment, SSRF, broken auth)
+  - JWT attack surface (alg=none, algorithm confusion, kid injection, jku SSRF)
+  - Parameter-layer attacks (pollution, verb tampering, content-type switching)
+  - GraphQL introspection, batching, alias flooding, depth attacks
+  - IDOR/BOLA object enumeration
+  - OAuth2/OIDC: redirect_uri manipulation, token substitution, scope escalation, PKCE downgrade
+  - gRPC: server reflection, service enumeration, gRPC-Web detection
+  - SOAP/WSDL: endpoint discovery, XXE in SOAP body
+  - JSON-RPC: system.listMethods, batch execution
+  - Business logic: numeric boundary, sequence breaking, price manipulation
+  - Rate limit bypass: IP header spoofing, path variation, encoding evasion
+  - Webhook SSRF: cloud metadata, internal service pivot
+  - Credential reuse: default creds against auth endpoints
+
+Usage:
+  python api_re.py http://target:port
+  python api_re.py http://target:port --depth deep
+  python api_re.py http://target:port --focus injection
+  python api_re.py http://target:port --fuzz-params /control
+  python api_re.py http://target:port --focus jwt
+  python api_re.py http://target:port --focus bola
+  python api_re.py http://target:port --focus oauth2
+  python api_re.py http://target:port --focus grpc
+  python api_re.py http://target:port --focus soap
 """
 
 import requests
@@ -44,6 +73,7 @@ class APIMap:
     framework: Optional[str] = None
     version: Optional[str] = None
     notes: list = field(default_factory=list)
+    findings: list = field(default_factory=list)
 
 
 # ─── Core HTTP helpers ────────────────────────────────────────────────────────
@@ -51,6 +81,7 @@ class APIMap:
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; api-re/1.0)"})
 TIMEOUT = 10
+VERBOSE = False
 
 
 def get(url, **kw):
@@ -72,6 +103,40 @@ def req(method, url, **kw):
         return SESSION.request(method, url, timeout=TIMEOUT, **kw)
     except Exception:
         return None
+
+
+import io
+import threading
+
+_stdout_lock = threading.Lock()
+
+
+def _run_phase_captured(fn, args):
+    """Run fn(*args), capturing stdout. Returns (result, captured_str)."""
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        result = fn(*args)
+    finally:
+        sys.stdout = old
+    return result, buf.getvalue()
+
+
+def _dedup_findings(findings):
+    """Deduplicate findings by (type, endpoint/path, param). Keeps first occurrence."""
+    seen = set()
+    out = []
+    for f in findings:
+        key = (
+            f.get("type"),
+            f.get("endpoint") or f.get("path"),
+            f.get("param"),
+        )
+        if key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out
 
 
 # ─── Phase 1: Framework Detection ────────────────────────────────────────────
@@ -399,8 +464,7 @@ def probe_param(base_url, path, param, method="GET", timeout=10):
                     result["confirmed_signals"] = confirmed
                     category_results.append(result)
                     print(f"  [!] {category} CONFIRMED on param={param!r}: {confirmed} | {result['body'][:80]}")
-                elif result["signals"]:
-                    # Signals fired but don't confirm this category — show as context only
+                elif result["signals"] and VERBOSE:
                     print(f"  [~] {category} probe on param={param!r}: signals={result['signals']} (not confirming for {category})")
 
             except Exception:
@@ -1438,13 +1502,21 @@ def probe_business_logic(base, endpoints):
 
             # Numeric boundary probing
             if any(n in pname_lower for n in numeric_names):
-                for val in boundary_values[:6]:
-                    for method in ep.methods[:1]:
+                for method in ep.methods[:1]:
+                    # Sentinel baseline: what does a valid value look like?
+                    _bl = req(method, url,
+                              json={param: 1} if method in ("POST", "PUT", "PATCH") else None,
+                              params={param: 1} if method == "GET" else {})
+                    _bl_body = _bl.text.strip() if _bl else None
+                    for val in boundary_values[:6]:
                         r = req(method, url,
                                 json={param: val} if method in ("POST", "PUT", "PATCH") else None,
                                 params={param: val} if method == "GET" else {})
                         if r and r.status_code not in (400, 422, 429):
                             if r.status_code == 200:
+                                probe_body = r.text.strip()
+                                if _bl_body is not None and probe_body == _bl_body:
+                                    continue
                                 print(f"  [BIZ_LOGIC_NUMERIC] {method} {ep.path} {param}={val}: 200 accepted")
                                 findings.append({"type": "business_logic_numeric",
                                                   "endpoint": f"{method} {ep.path}",
@@ -1453,12 +1525,19 @@ def probe_business_logic(base, endpoints):
 
             # Status/role privilege escalation
             if any(n in pname_lower for n in status_names):
-                for val in privileged_values[:4]:
-                    for method in ("POST", "PUT", "PATCH"):
-                        if method not in ep.methods:
-                            continue
+                for method in ("POST", "PUT", "PATCH"):
+                    if method not in ep.methods:
+                        continue
+                    # Sentinel baseline: garbage value — if server 200s this too, it's not meaningful
+                    _bl = req(method, url, json={param: "__sentinel_xyz_12345__"})
+                    _bl_code = _bl.status_code if _bl else None
+                    _bl_body = _bl.text.strip() if _bl else None
+                    for val in privileged_values[:4]:
                         r = req(method, url, json={param: val})
                         if r and r.status_code == 200:
+                            probe_body = r.text.strip()
+                            if _bl_code == 200 and _bl_body is not None and probe_body == _bl_body:
+                                continue
                             print(f"  [BIZ_LOGIC_PRIV] {method} {ep.path} {param}={val}: accepted!")
                             findings.append({"type": "business_logic_privilege",
                                               "endpoint": f"{method} {ep.path}",
@@ -2222,9 +2301,16 @@ def probe_null_byte_evasion(base, endpoints):
             if param == "__body__":
                 continue
 
+            # Per-param sentinel: if probe response matches this, param is ignored
+            _sentinel = get(url, params={param: "safe_value_sentinel_xyz_12345"})
+            _sentinel_body = _sentinel.text.strip() if _sentinel else None
+
             for null_var in NULL_BYTE_VARIANTS[:3]:
                 r = get(url, params={param: f"safe_value{null_var}admin"})
                 if r and r.status_code not in (400, 404):
+                    probe_body = r.text.strip()
+                    if _sentinel_body is not None and probe_body == _sentinel_body:
+                        continue
                     if r.status_code != baseline_code or "admin" in r.text.lower():
                         print(f"  [NULL_BYTE] {ep.path}?{param}=...{null_var!r}...: {r.status_code}")
                         findings.append({"type": "null_byte_inject", "endpoint": ep.path,
@@ -2770,75 +2856,60 @@ def run_re(base_url, depth="normal", focus=None):
         print("\n[16] Default credentials probe...")
         cred_findings = probe_default_creds(base)
 
-    # Phase 17: CORS misconfiguration
+    # Phases 17-30: independent — run in parallel via ThreadPoolExecutor
+    _phase_queue = []
+
     if focus in (None, "auth", "cors") and depth in ("normal", "deep"):
-        print("\n[17] CORS misconfiguration probe...")
-        cors_findings = probe_cors(base, api.endpoints)
-
-    # Phase 18: JWT algorithm confusion (RS256 → HS256)
+        _phase_queue.append((17, "CORS misconfiguration", probe_cors, (base, api.endpoints)))
     if focus in (None, "jwt", "auth") and depth in ("normal", "deep"):
-        print("\n[18] JWT algorithm confusion probe...")
-        jwt_alg_findings = probe_jwt_alg_confusion(base, api.endpoints)
-
-    # Phase 19: NoSQL injection
+        _phase_queue.append((18, "JWT alg confusion", probe_jwt_alg_confusion, (base, api.endpoints)))
     if focus in (None, "injection", "nosql") and depth in ("normal", "deep"):
-        print("\n[19] NoSQL injection probe...")
-        nosql_findings = probe_nosql_injection(base, api.endpoints)
-
-    # Phase 20: BFLA (Broken Function Level Authorization)
+        _phase_queue.append((19, "NoSQL injection", probe_nosql_injection, (base, api.endpoints)))
     if focus in (None, "bola", "auth", "bfla") and depth in ("normal", "deep"):
-        print("\n[20] BFLA probe...")
-        bfla_findings = probe_bfla(base, api.endpoints)
-
-    # Phase 21: Excessive data exposure / PII scanner
+        _phase_queue.append((20, "BFLA", probe_bfla, (base, api.endpoints)))
     if focus in (None, "schema", "pii") and depth in ("normal", "deep"):
-        print("\n[21] Data exposure / PII scan...")
-        pii_findings = probe_excessive_data_exposure(base, api.endpoints)
-
-    # Phase 22: Host header injection
+        _phase_queue.append((21, "Data exposure / PII", probe_excessive_data_exposure, (base, api.endpoints)))
     if focus in (None, "injection", "ssrf") and depth in ("normal", "deep"):
-        print("\n[22] Host header injection probe...")
-        host_findings = probe_host_header_injection(base, api.endpoints)
-
-    # Phase 23: Timing oracle (user enumeration)
+        _phase_queue.append((22, "Host header injection", probe_host_header_injection, (base, api.endpoints)))
     if focus in (None, "auth", "creds", "timing") and depth == "deep":
-        print("\n[23] Timing oracle probe...")
-        timing_findings = probe_timing_oracle(base, api.endpoints)
-
-    # Phase 24: Second-order injection detection
+        _phase_queue.append((23, "Timing oracle", probe_timing_oracle, (base, api.endpoints)))
     if focus in (None, "injection") and depth == "deep":
-        print("\n[24] Second-order injection probe...")
-        second_order_findings = probe_second_order_injection(base, api.endpoints)
-
-    # Phase 25: Null byte / WAF evasion
+        _phase_queue.append((24, "Second-order injection", probe_second_order_injection, (base, api.endpoints)))
     if focus in (None, "injection", "evasion") and depth in ("normal", "deep"):
-        print("\n[25] Null byte / WAF evasion probe...")
-        nullbyte_findings = probe_null_byte_evasion(base, api.endpoints)
-
-    # Phase 26: OAuth dynamic client registration + token introspection
+        _phase_queue.append((25, "Null byte / WAF evasion", probe_null_byte_evasion, (base, api.endpoints)))
     if focus in (None, "oauth2", "auth") and depth in ("normal", "deep"):
-        print("\n[26] OAuth dynamic registration + token introspection probe...")
-        oauth_dyn_findings = probe_oauth_dynamic_reg(base, api.endpoints)
-
-    # Phase 27: WebSocket / GraphQL subscription enumeration
+        _phase_queue.append((26, "OAuth dynamic reg", probe_oauth_dynamic_reg, (base, api.endpoints)))
     if focus in (None, "graphql", "schema", "websocket") and depth in ("normal", "deep"):
-        print("\n[27] WebSocket / subscription probe...")
-        ws_findings = probe_websocket(base)
-
-    # Phase 28: Pagination traversal (BOLA at scale)
+        _phase_queue.append((27, "WebSocket / SSE", probe_websocket, (base,)))
     if focus in (None, "bola", "schema") and depth == "deep":
-        print("\n[28] Pagination traversal probe...")
-        pagination_findings = probe_pagination_traversal(base, api.endpoints)
-
-    # Phase 29: Deprecation / shadow version detection
+        _phase_queue.append((28, "Pagination traversal", probe_pagination_traversal, (base, api.endpoints)))
     if focus in (None, "schema", "shadow") and depth in ("normal", "deep"):
-        print("\n[29] Shadow/deprecated version probe...")
-        shadow_findings = probe_shadow_versions(base, api.endpoints)
-
-    # Phase 30: OAuth state parameter + PKCE downgrade
+        _phase_queue.append((29, "Shadow/deprecated versions", probe_shadow_versions, (base, api.endpoints)))
     if focus in (None, "oauth2", "auth") and depth in ("normal", "deep"):
-        print("\n[30] OAuth state/PKCE probe...")
-        oauth_state_findings = probe_oauth_state_pkce(base)
+        _phase_queue.append((30, "OAuth state / PKCE", probe_oauth_state_pkce, (base,)))
+
+    if _phase_queue:
+        print(f"\n[*] Phases {[n for n,_,_,_ in _phase_queue]} — running in parallel (workers=6)...")
+        _phase_results = {}
+        with ThreadPoolExecutor(max_workers=6) as _ex:
+            _futures = {
+                _ex.submit(_run_phase_captured, fn, args): (num, label)
+                for num, label, fn, args in _phase_queue
+            }
+            for _fut in as_completed(_futures):
+                _num, _label = _futures[_fut]
+                try:
+                    _result, _output = _fut.result()
+                    _phase_results[_num] = (_label, _result or [], _output)
+                except Exception as _e:
+                    _phase_results[_num] = (_label, [], f"  ERROR: {_e}\n")
+
+        for _num in sorted(_phase_results):
+            _label, _findings, _output = _phase_results[_num]
+            print(f"\n[{_num}] {_label}...")
+            if _output:
+                print(_output, end="")
+            api.findings.extend(_findings)
 
     # Summary
     print(f"\n{'='*60}")
@@ -2856,10 +2927,7 @@ def run_re(base_url, depth="normal", focus=None):
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(
-        prog="frwitch",
-        description="French Witchcraft — 30-phase API reverse engineering tool",
-    )
+    ap = argparse.ArgumentParser(prog="frwitch", description="French Witchcraft — 30-phase API RE")
     ap.add_argument("target", help="Base URL (http://host:port)")
     ap.add_argument("--depth", choices=["quick", "normal", "deep"], default="normal")
     ap.add_argument("--focus",
@@ -2871,7 +2939,12 @@ def main():
     ap.add_argument("--fuzz-params", metavar="PATH",
                     help="Deep parameter fuzzing for a specific path")
     ap.add_argument("--output", help="Write JSON report to file")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Show non-confirming probe signals ([~] lines)")
     args = ap.parse_args()
+
+    if args.verbose:
+        VERBOSE = True
 
     api = run_re(args.target, depth=args.depth, focus=args.focus)
 
@@ -2890,11 +2963,12 @@ def main():
             "base_url": api.base_url,
             "framework": api.framework,
             "endpoints": [asdict(e) for e in api.endpoints],
+            "findings": _dedup_findings(api.findings),
             "notes": api.notes,
         }
         with open(args.output, "w") as f:
             json.dump(out, f, indent=2)
-        print(f"\n[+] Report saved: {args.output}")
+        print(f"\n[+] Report saved: {args.output} ({len(out['findings'])} findings)")
 
 
 if __name__ == "__main__":
