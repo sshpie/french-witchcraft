@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "french-witchcraft"
+version = "1.0.0"
+description = "30-phase autonomous API reverse engineering tool"
+requires-python = ">=3.8"
+dependencies = ["requests>=2.28"]
+license = {text = "MIT"}
+
+[project.scripts]
+frwitch = "french_witchcraft.core:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["french_witchcraft*"]
