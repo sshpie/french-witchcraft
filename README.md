@@ -11,11 +11,6 @@
 
 Point it at any HTTP API. It maps the surface, extracts schema, and probes for vulnerabilities — no prior knowledge required.
 
-It autonomously:Reverse-engineers unknown HTTP APIs
-Maps endpoints and schemas
-Actively probes for a wide range of vulnerabilities (injection, JWT attacks, BOLA/IDOR, BFLA, mass assignment, SSRF, NoSQL injection, OAuth issues, etc.)
-
-
 
 ## Install
 
